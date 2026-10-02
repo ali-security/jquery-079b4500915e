@@ -1,0 +1,143 @@
+name: build-pack
+
+# Build-and-pack only: reproduces the public npm tarball
+# https://registry.npmjs.org/jquery/-/jquery-1.11.1.tgz (packed May 2014 with
+# npm 1.2.25 / node 0.10). The test suite runs on Travis (.travis.yml).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-pack:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node 0.10 via nvm
+        run: |
+          export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+          if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+            curl -fsSL -o "$RUNNER_TEMP/nvm-install.sh" https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh
+            bash "$RUNNER_TEMP/nvm-install.sh"
+            export NVM_DIR="$HOME/.nvm"
+          fi
+          . "$NVM_DIR/nvm.sh"
+          nvm install 0.10
+          nvm use 0.10
+          # Every later run: step is a fresh shell; put node 0.10 first on PATH.
+          dirname "$(nvm which 0.10)" >> "$GITHUB_PATH"
+          node --version
+          npm --version
+
+      - name: Point npm at the Seal registry time machine (2014-05-01)
+        run: |
+          node --version
+          npm --version
+          npm config set registry "https://:2014-05-01T18%3A05%3A32.863Z@time-machines-npm.sealsecurity.io/"
+          # Node 0.10's OpenSSL / CA bundle cannot validate modern certificates.
+          npm config set strict-ssl false
+          # Documented fallback host if node 0.10 cannot reach the primary one:
+          #   https://:2014-05-01T18%3A05%3A32.863Z@time-machines-npm-direct-download.sealsecurity.io/
+          npm config get registry
+
+      - name: npm install
+        # Real clock: running under faketime would make TLS certs "not yet valid".
+        run: npm install
+
+      - name: Build with grunt under a faked clock
+        # build/tasks/build.js stamps @DATE with new Date() (public header:
+        # "Date: 2014-05-01T17:42Z") and the uglify banner uses
+        # grunt.template.today('yyyy') (public: "(c) 2005, 2014").
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y faketime
+          TZ=UTC faketime '2014-05-01 17:42:00' ./node_modules/.bin/grunt
+          head -13 dist/jquery.js
+          echo
+          head -c 120 dist/jquery.min.js
+          echo
+          ls -l dist
+
+      - name: Generate CDN copies (build/release.js makeReleaseCopies)
+        # Reimplemented with plain fs (ES5) because release.js needs shelljs,
+        # which is not a devDependency. The googlecdn/mscdn zips are not built:
+        # they are not part of the npm tarball.
+        run: |
+          cat > "$RUNNER_TEMP/make-release-copies.js" <<'EOF'
+          var fs = require( "fs" ),
+            version = "1.11.1",
+            preRelease = false,
+            devFile = "dist/jquery.js",
+            minFile = "dist/jquery.min.js",
+            mapFile = "dist/jquery.min.map",
+            cdnFolder = "dist/cdn",
+            releaseFiles = {
+              "jquery-VER.js": devFile,
+              "jquery-VER.min.js": minFile,
+              "jquery-VER.min.map": mapFile,
+              "jquery.js": devFile,
+              "jquery.min.js": minFile,
+              "jquery.min.map": mapFile,
+              "jquery-latest.js": devFile,
+              "jquery-latest.min.js": minFile,
+              "jquery-latest.min.map": mapFile
+            };
+
+          if ( !fs.existsSync( cdnFolder ) ) {
+            fs.mkdirSync( cdnFolder );
+          }
+
+          Object.keys( releaseFiles ).forEach(function( key ) {
+            var text,
+              builtFile = releaseFiles[ key ],
+              unpathedFile = key.replace( /VER/g, version ),
+              releaseFile = cdnFolder + "/" + unpathedFile;
+
+            // Beta releases don't update the jquery-latest etc. copies
+            if ( !preRelease || key.indexOf( "VER" ) >= 0 ) {
+              if ( /\.map$/.test( releaseFile ) ) {
+                text = fs.readFileSync( builtFile, "utf8" )
+                  .replace( /"file":"([^"]+)","sources":\["([^"]+)"\]/,
+                    "\"file\":\"" + unpathedFile.replace( /\.min\.map/, ".min.js" ) +
+                    "\",\"sources\":[\"" + unpathedFile.replace( /\.min\.map/, ".js" ) + "\"]" );
+                fs.writeFileSync( releaseFile, text );
+              } else if ( /\.min\.js$/.test( releaseFile ) ) {
+                text = fs.readFileSync( builtFile, "utf8" )
+                  .replace( /\/\/# sourceMappingURL=\S+/, "" );
+                fs.writeFileSync( releaseFile, text );
+              } else if ( builtFile !== releaseFile ) {
+                // Straight byte copy (shell.cp -f equivalent)
+                fs.writeFileSync( releaseFile, fs.readFileSync( builtFile ) );
+              }
+            }
+          });
+          EOF
+          node --version
+          node "$RUNNER_TEMP/make-release-copies.js"
+          ls -l dist/cdn
+
+      - name: npm pack
+        run: |
+          node --version
+          npm --version
+          # Keep CI-only / build-byproduct files out of the tarball: .npmignore
+          # does not list them and neither is in the public 1.11.1 tarball.
+          # (pack-out/ is created after packing for the same reason.)
+          rm -rf .github
+          rm -f .sizecache.json
+          npm pack
+          mkdir -p pack-out
+          mv jquery-1.11.1.tgz pack-out/
+          tar tzvf pack-out/jquery-1.11.1.tgz
+
+      - name: Upload npm package
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: pack-out/jquery-1.11.1.tgz
+          if-no-files-found: error

@@ -1,3 +1,24 @@
 language: node_js
 node_js:
 - '0.10'
+addons:
+  chrome: stable
+before_script:
+# Serve the repo root over PHP (the ajax fixtures in test/data are PHP). Multiple
+# workers so a sleeping fixture (name.php?wait=N) does not block other requests;
+# PHP diagnostics go to the server log instead of into fixture responses.
+- php --version
+- PHP_CLI_SERVER_WORKERS=4 php -d display_errors=stderr -S 127.0.0.1:8000 -t . > /tmp/php-server.log 2>&1 &
+- for i in $(seq 1 30); do curl -sf -o /dev/null http://127.0.0.1:8000/test/index.html && break; sleep 1; done
+- curl -sf -o /dev/null http://127.0.0.1:8000/test/index.html
+# Install the headless-browser runner deps with a modern Node, in a subshell and
+# outside the project, so Node 0.10 and node_modules stay untouched for npm test.
+- (nvm install 18 && mkdir -p /tmp/browser-runner && cd /tmp/browser-runner && npm init -y && npm install puppeteer-core@21 --registry=https://registry.npmjs.org/)
+- node --version
+script:
+# Lint + build dist/jquery.js (which test/index.html loads).
+- npm test
+# Run the QUnit browser suite (test/index.html) in headless Chrome.
+- NODE_PATH=/tmp/browser-runner/node_modules nvm exec 18 node test/run-browser-tests.js
+after_failure:
+- tail -100 /tmp/php-server.log
